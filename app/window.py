@@ -7,6 +7,8 @@
 - 下部: 出力テキストボックス（API応答）
 """
 
+import threading
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QLabel, QLineEdit,
@@ -263,7 +265,7 @@ class ApiWorker(QThread):
     API呼び出しを別スレッドで実行するワーカー
 
     UIをブロックしないようにバックグラウンドでAPI通信を行う。
-    ストリーミングレスポンスに対応。
+    ストリーミングレスポンスに対応し、キャンセル機能を持つ。
     """
 
     # 完了シグナル: レスポンスを返す
@@ -278,7 +280,8 @@ class ApiWorker(QThread):
         system_prompt: str,
         model: str,
         temperature: float,
-        max_tokens: int
+        max_tokens: int,
+        cancel_event: threading.Event = None
     ):
         super().__init__()
         self.client = client
@@ -287,6 +290,7 @@ class ApiWorker(QThread):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.cancel_event = cancel_event
 
     def run(self):
         """スレッドで実行される処理（ストリーミング対応）"""
@@ -297,7 +301,8 @@ class ApiWorker(QThread):
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             stream=True,
-            on_chunk=self._on_chunk
+            on_chunk=self._on_chunk,
+            cancel_event=self.cancel_event
         )
         self.finished.emit(response)
 
@@ -323,6 +328,9 @@ class MainWindow(QMainWindow):
         self.client: ChatGPTClient = None
         self.worker: ApiWorker = None
         self.model_fetch_worker: ModelFetchWorker = None
+
+        # キャンセル用のイベント
+        self.cancel_event: threading.Event = None
 
         # プリセットボタンのリスト
         self.preset_buttons: list = []
@@ -543,7 +551,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)  # stretch=1 で残りスペースを使用
 
         # ============================================
-        # 送信ボタン
+        # 送信・停止ボタン
         # ============================================
         button_layout = QHBoxLayout()
 
@@ -571,6 +579,33 @@ class MainWindow(QMainWindow):
         self.send_btn.clicked.connect(self._send_request)
         button_layout.addWidget(self.send_btn)
 
+        # 停止ボタン（処理中のみ有効）
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setMinimumHeight(40)
+        self.stop_btn.setMaximumWidth(80)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #dc2626;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border: none;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #b91c1c;
+            }
+            QPushButton:pressed {
+                background-color: #991b1b;
+            }
+            QPushButton:disabled {
+                background-color: #9ca3af;
+            }
+        """)
+        self.stop_btn.clicked.connect(self._cancel_request)
+        button_layout.addWidget(self.stop_btn)
+
         layout.addLayout(button_layout)
 
         # ============================================
@@ -586,11 +621,21 @@ class MainWindow(QMainWindow):
         # Ctrl+Enter で送信
         self.input_text.installEventFilter(self)
 
+    def _clear_layout(self, layout):
+        """レイアウト内のすべてのアイテムを再帰的に削除"""
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            child = item.layout()
+            if child is not None:
+                self._clear_layout(child)
+
     def _create_preset_buttons(self):
         """プリセットボタンを作成"""
-        # 既存のボタンをクリア
-        for btn in self.preset_buttons:
-            btn.deleteLater()
+        # レイアウトを完全にクリア（stretch含む）
+        self._clear_layout(self.preset_btn_layout)
         self.preset_buttons.clear()
 
         # 新しいボタンを作成
@@ -836,9 +881,13 @@ class MainWindow(QMainWindow):
         # クライアント作成
         self.client = ChatGPTClient(api_key)
 
+        # キャンセル用イベントを作成
+        self.cancel_event = threading.Event()
+
         # UIを処理中状態に（誤操作防止のため各種UI要素を無効化）
         self.send_btn.setEnabled(False)
         self.send_btn.setText("処理中...")
+        self.stop_btn.setEnabled(True)  # 停止ボタンを有効化
         self.api_key_input.setEnabled(False)
         self.model_combo.setEnabled(False)
         self.temp_spin.setEnabled(False)
@@ -857,12 +906,20 @@ class MainWindow(QMainWindow):
             system_prompt=self.system_prompt_input.toPlainText(),
             model=self.model_combo.currentText(),
             temperature=self.temp_spin.value(),
-            max_tokens=self.tokens_spin.value()
+            max_tokens=self.tokens_spin.value(),
+            cancel_event=self.cancel_event
         )
         # UniqueConnectionで重複接続を防止
         self.worker.finished.connect(self._on_response, Qt.UniqueConnection)
         self.worker.chunk_received.connect(self._on_chunk, Qt.UniqueConnection)
         self.worker.start()
+
+    def _cancel_request(self):
+        """ストリーミングリクエストをキャンセル"""
+        if self.cancel_event:
+            self.cancel_event.set()
+            self.stop_btn.setEnabled(False)
+            self._set_status("キャンセル中...", "orange")
 
     def _on_chunk(self, chunk_text: str):
         """ストリーミングチャンクを受信した時の処理"""
@@ -879,6 +936,7 @@ class MainWindow(QMainWindow):
         # UIを通常状態に戻す（全要素を有効化）
         self.send_btn.setEnabled(True)
         self.send_btn.setText("送信 (Ctrl+Enter)")
+        self.stop_btn.setEnabled(False)  # 停止ボタンを無効化
         self.api_key_input.setEnabled(True)
         self.model_combo.setEnabled(True)
         self.temp_spin.setEnabled(True)
@@ -887,8 +945,12 @@ class MainWindow(QMainWindow):
         self.save_config_btn.setEnabled(True)
 
         if response.success:
-            # ストリーミングで既にテキストは表示されているので、ステータスのみ更新
-            self._set_status("完了", "green")
+            if response.cancelled:
+                # キャンセルされた場合
+                self._set_status("キャンセルしました", "orange")
+            else:
+                # ストリーミングで既にテキストは表示されているので、ステータスのみ更新
+                self._set_status("完了", "green")
         else:
             # エラーの場合は出力エリアにエラーメッセージを表示
             self.output_text.setPlainText(f"エラー: {response.error}")

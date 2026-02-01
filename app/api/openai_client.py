@@ -8,6 +8,7 @@ OpenAI Responses APIを使用してテキスト生成を行う。
 from openai import OpenAI
 from typing import Optional, Callable, List, Any
 from dataclasses import dataclass
+import threading
 
 
 @dataclass
@@ -19,10 +20,12 @@ class ChatResponse:
         success: リクエストが成功したか
         content: レスポンスの本文（成功時）
         error: エラーメッセージ（失敗時）
+        cancelled: ユーザーによってキャンセルされたか
     """
     success: bool
     content: str = ""
     error: str = ""
+    cancelled: bool = False
 
 
 class ChatGPTClient:
@@ -65,25 +68,28 @@ class ChatGPTClient:
             return "接続エラー: インターネット接続を確認してください"
         elif "model_not_found" in error_lower or "model not found" in error_lower:
             return "指定されたモデルが見つかりません"
+        elif "context_length" in error_lower or "maximum context" in error_lower:
+            return "入力が長すぎます。テキストを短くするか、最大トークン数を下げてください"
+        elif "max_tokens" in error_lower or "max_output_tokens" in error_lower:
+            return "出力トークン数の設定を確認してください"
 
         return error_message
 
-    def _supports_temperature(self, model: str) -> bool:
+    def _is_temperature_error(self, error_message: str) -> bool:
         """
-        モデルが temperature パラメータをサポートするかどうかを判定
+        エラーがtemperature非対応によるものか判定
 
         Args:
-            model: モデル名
+            error_message: エラーメッセージ
 
         Returns:
-            bool: temperature をサポートする場合 True
+            bool: temperature非対応エラーの場合True
         """
-        # o1, o3, gpt-5 シリーズは temperature をサポートしない（推論モデル）
-        no_temp_prefixes = ['o1-', 'o3-', 'gpt-5', 'gpt5']
-        for prefix in no_temp_prefixes:
-            if model.startswith(prefix):
-                return False
-        return True
+        error_lower = error_message.lower()
+        return ("temperature" in error_lower and
+                ("unsupported" in error_lower or
+                 "not supported" in error_lower or
+                 "unknown parameter" in error_lower))
 
     def _extract_delta_text(self, event: Any) -> str:
         """
@@ -176,6 +182,7 @@ class ChatGPTClient:
         max_tokens: int = 1024,
         stream: bool = True,
         on_chunk: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> ChatResponse:
         """
         メッセージを送信してレスポンスを取得（Responses API使用）
@@ -188,6 +195,7 @@ class ChatGPTClient:
             max_tokens: 最大出力トークン数 → max_output_tokens へ
             stream: ストリーミングレスポンスを使用するか
             on_chunk: ストリーミング時のチャンクコールバック
+            cancel_event: キャンセル用のイベント
 
         Returns:
             ChatResponse: APIからのレスポンス
@@ -213,7 +221,8 @@ class ChatGPTClient:
                     system_prompt=system_prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    on_chunk=on_chunk
+                    on_chunk=on_chunk,
+                    cancel_event=cancel_event
                 )
             else:
                 return self._non_stream_response(
@@ -230,6 +239,47 @@ class ChatGPTClient:
                 success=False,
                 error=error_message
             )
+
+    def _build_api_params(
+        self,
+        model: str,
+        user_message: str,
+        system_prompt: str,
+        max_tokens: int,
+        temperature: Optional[float] = None,
+        stream: bool = False,
+    ) -> dict:
+        """
+        APIパラメータを構築
+
+        Args:
+            model: モデル名
+            user_message: ユーザーメッセージ
+            system_prompt: システムプロンプト
+            max_tokens: 最大出力トークン数
+            temperature: 温度パラメータ（Noneなら含めない）
+            stream: ストリーミングモード
+
+        Returns:
+            dict: APIパラメータ
+        """
+        api_params = {
+            'model': model,
+            'input': [{"role": "user", "content": user_message}],
+            'max_output_tokens': max_tokens,
+            'store': False,
+        }
+
+        if stream:
+            api_params['stream'] = True
+
+        if temperature is not None:
+            api_params['temperature'] = temperature
+
+        if system_prompt and system_prompt.strip():
+            api_params['instructions'] = system_prompt
+
+        return api_params
 
     def _non_stream_response(
         self,
@@ -253,23 +303,32 @@ class ChatGPTClient:
             ChatResponse: 完全なレスポンス
         """
         try:
-            # Responses API パラメータを構築（role付き形式）
-            api_params = {
-                'model': model,
-                'input': [{"role": "user", "content": user_message}],
-                'max_output_tokens': max_tokens,
-            }
+            # まずtemperature付きで試行
+            api_params = self._build_api_params(
+                model=model,
+                user_message=user_message,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=False
+            )
 
-            # temperature をサポートするモデルのみ設定
-            if self._supports_temperature(model):
-                api_params['temperature'] = temperature
-
-            # system_prompt が空でない場合のみ instructions を設定
-            if system_prompt and system_prompt.strip():
-                api_params['instructions'] = system_prompt
-
-            # Responses API を呼び出す
-            response = self.client.responses.create(**api_params)
+            try:
+                response = self.client.responses.create(**api_params)
+            except Exception as e:
+                # temperature非対応エラーなら再試行
+                if self._is_temperature_error(str(e)):
+                    api_params_no_temp = self._build_api_params(
+                        model=model,
+                        user_message=user_message,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                        temperature=None,
+                        stream=False
+                    )
+                    response = self.client.responses.create(**api_params_no_temp)
+                else:
+                    raise
 
             # 堅牢なテキスト抽出
             content = self._extract_output_text(response)
@@ -294,6 +353,7 @@ class ChatGPTClient:
         temperature: float,
         max_tokens: int,
         on_chunk: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> ChatResponse:
         """
         ストリーミングでResponses APIを呼び出す
@@ -305,33 +365,50 @@ class ChatGPTClient:
             temperature: 温度パラメータ
             max_tokens: 最大出力トークン数
             on_chunk: チャンク受信時のコールバック
+            cancel_event: キャンセル用のイベント
 
         Returns:
             ChatResponse: 完全なレスポンス
         """
         try:
-            # Responses API パラメータを構築（role付き形式）
-            api_params = {
-                'model': model,
-                'input': [{"role": "user", "content": user_message}],
-                'max_output_tokens': max_tokens,
-                'stream': True,
-            }
+            # まずtemperature付きで試行
+            api_params = self._build_api_params(
+                model=model,
+                user_message=user_message,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True
+            )
 
-            # temperature をサポートするモデルのみ設定
-            if self._supports_temperature(model):
-                api_params['temperature'] = temperature
-
-            # system_prompt が空でない場合のみ instructions を設定
-            if system_prompt and system_prompt.strip():
-                api_params['instructions'] = system_prompt
-
-            # Responses API をストリーミングで呼び出す
-            stream = self.client.responses.create(**api_params)
+            try:
+                stream = self.client.responses.create(**api_params)
+            except Exception as e:
+                # temperature非対応エラーなら再試行
+                if self._is_temperature_error(str(e)):
+                    api_params_no_temp = self._build_api_params(
+                        model=model,
+                        user_message=user_message,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                        temperature=None,
+                        stream=True
+                    )
+                    stream = self.client.responses.create(**api_params_no_temp)
+                else:
+                    raise
 
             full_content = ""
 
             for event in stream:
+                # キャンセルチェック
+                if cancel_event and cancel_event.is_set():
+                    return ChatResponse(
+                        success=True,
+                        content=full_content,
+                        cancelled=True
+                    )
+
                 # イベントタイプを安全に取得
                 event_type = getattr(event, 'type', None)
 
@@ -415,7 +492,7 @@ def fetch_available_models(api_key: str) -> Optional[List[str]]:
                     models.append(model_id)
 
         # モデルを優先度順にソート（新しいモデルを優先）
-        priority_order = ['gpt-4o', 'gpt-4', 'o1-', 'o3-', 'gpt-3.5']
+        priority_order = ['gpt-5', 'gpt-4o', 'gpt-4', 'o1-', 'o3-', 'gpt-3.5']
 
         def sort_key(model_name: str) -> tuple:
             # 優先度を数値化（小さいほど優先）
