@@ -29,6 +29,9 @@ from app.config import (
     AppConfig, load_config, save_config, is_api_key_pattern, get_api_key,
     AVAILABLE_MODELS, MAX_TOKENS_LIMIT, PromptPreset, DEFAULT_PRESETS
 )
+
+# APIキーのマスク表示用定数
+API_KEY_MASKED = "********"
 from app.api.openai_client import ChatGPTClient, ChatResponse, fetch_available_models
 
 
@@ -363,7 +366,7 @@ class MainWindow(QMainWindow):
         # システムトレイ設定
         self._setup_system_tray()
 
-        # グローバルホットキー設定（Ctrl+Alt+C）
+        # グローバルホットキー設定（Ctrl+Alt+V）
         self._setup_global_hotkey()
 
     def _setup_ui(self):
@@ -745,9 +748,9 @@ class MainWindow(QMainWindow):
 
     def _apply_config(self):
         """設定をUIに反映"""
-        # APIキーが保存済みの場合は ******** を表示
+        # APIキーが保存済みの場合はマスク表示
         if self.config.api_key:
-            self.api_key_input.setText("********")
+            self.api_key_input.setText(API_KEY_MASKED)
         self.model_combo.setCurrentText(self.config.model)
         self.system_prompt_input.setPlainText(self.config.system_prompt)
         self.temp_spin.setValue(self.config.temperature)
@@ -763,9 +766,9 @@ class MainWindow(QMainWindow):
 
     def _save_config(self):
         """現在のUI設定を保存"""
-        # APIキー入力欄が空でなく、placeholder(********)でない場合のみ更新
+        # APIキー入力欄が空でなく、マスク表示でない場合のみ更新
         api_key_text = self.api_key_input.text().strip()
-        if api_key_text and api_key_text != "********":
+        if api_key_text and api_key_text != API_KEY_MASKED:
             self.config.api_key = api_key_text
 
         # モデル名を保存（placeholder以外）
@@ -781,9 +784,9 @@ class MainWindow(QMainWindow):
 
         if save_config(self.config):
             self._set_status("設定を保存しました", "green")
-            # 保存成功時にAPIキー入力欄を ******** に戻す（保存済み表示）
+            # 保存成功時にAPIキー入力欄をマスク表示に戻す
             if self.config.api_key:
-                self.api_key_input.setText("********")
+                self.api_key_input.setText(API_KEY_MASKED)
             else:
                 self.api_key_input.clear()
         else:
@@ -863,6 +866,31 @@ class MainWindow(QMainWindow):
         else:
             self._set_status("コピーするテキストがありません", "orange")
 
+    def _resolve_api_key(self) -> str:
+        """
+        APIキーを解決する
+
+        優先順位:
+        1) UI入力（ただしマスク表示は除外）
+        2) self.config.api_key（keyringから読み込み済み）
+        3) get_api_key()（環境変数→keyring）
+
+        Returns:
+            str: 解決されたAPIキー（未解決なら空文字列）
+        """
+        # 1) UI入力をチェック（マスク表示は除外）
+        ui_key = self.api_key_input.text().strip()
+        if ui_key and ui_key != API_KEY_MASKED:
+            return ui_key
+
+        # 2) config.api_key（keyringから読み込み済み）
+        if self.config.api_key:
+            return self.config.api_key
+
+        # 3) get_api_key()（環境変数→keyring）
+        key = get_api_key()
+        return key if key else ""
+
     def _cleanup_worker(self):
         """古いワーカースレッドをクリーンアップ"""
         if self.worker is not None:
@@ -886,15 +914,11 @@ class MainWindow(QMainWindow):
 
     def _send_request(self):
         """APIリクエストを送信"""
-        # APIキーチェック（UI入力→環境変数/keyringの順でフォールバック）
-        api_key = self.api_key_input.text().strip()
+        # APIキーを解決
+        api_key = self._resolve_api_key()
         if not api_key:
-            # UI入力が空の場合、環境変数またはkeyringから取得
-            from app.config import get_api_key
-            api_key = get_api_key()
-            if not api_key:
-                self._set_status("APIキーを入力してください", "red")
-                return
+            self._set_status("APIキーを入力してください", "red")
+            return
 
         # 入力テキストチェック
         input_text = self.input_text.toPlainText().strip()
@@ -1026,10 +1050,8 @@ class MainWindow(QMainWindow):
 
     def _fetch_models(self):
         """利用可能なモデルリストを動的に取得"""
-        # APIキーを取得（UI入力→環境変数/keyringの順）
-        api_key = self.api_key_input.text().strip()
-        if not api_key:
-            api_key = get_api_key()
+        # APIキーを解決
+        api_key = self._resolve_api_key()
 
         if not api_key:
             # APIキーがない場合はコンボを無効化し placeholder 表示
