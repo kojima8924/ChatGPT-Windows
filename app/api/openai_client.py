@@ -86,10 +86,11 @@ class ChatGPTClient:
             bool: temperature非対応エラーの場合True
         """
         error_lower = error_message.lower()
-        return ("temperature" in error_lower and
-                ("unsupported" in error_lower or
-                 "not supported" in error_lower or
-                 "unknown parameter" in error_lower))
+        if "temperature" not in error_lower:
+            return False
+        # エラーメッセージ文言の揺れに対応
+        error_keywords = ["unsupported", "not supported", "unknown", "invalid", "unrecognized"]
+        return any(kw in error_lower for kw in error_keywords)
 
     def _extract_delta_text(self, event: Any) -> str:
         """
@@ -403,6 +404,13 @@ class ChatGPTClient:
             for event in stream:
                 # キャンセルチェック
                 if cancel_event and cancel_event.is_set():
+                    # ストリームを明示的にクローズ
+                    try:
+                        close_fn = getattr(stream, "close", None)
+                        if callable(close_fn):
+                            close_fn()
+                    except Exception:
+                        pass
                     return ChatResponse(
                         success=True,
                         content=full_content,

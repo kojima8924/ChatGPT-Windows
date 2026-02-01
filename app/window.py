@@ -762,6 +762,8 @@ class MainWindow(QMainWindow):
 
         if save_config(self.config):
             self._set_status("設定を保存しました", "green")
+            # 保存成功時にAPIキー入力欄をクリア（覗き見耐性向上）
+            self.api_key_input.clear()
         else:
             self._set_status("設定の保存に失敗しました", "red")
 
@@ -839,6 +841,9 @@ class MainWindow(QMainWindow):
     def _cleanup_worker(self):
         """古いワーカースレッドをクリーンアップ"""
         if self.worker is not None:
+            # 実行中ならキャンセルを投げる
+            if self.worker.isRunning() and self.cancel_event:
+                self.cancel_event.set()
             # シグナル接続を解除
             try:
                 self.worker.finished.disconnect()
@@ -850,8 +855,9 @@ class MainWindow(QMainWindow):
                 pass  # すでに接続解除されている場合
             # スレッドが終了するまで待機（タイムアウト付き）
             if self.worker.isRunning():
-                self.worker.wait(1000)  # 最大1秒待機
+                self.worker.wait(1500)  # 最大1.5秒待機
             self.worker = None
+            self.cancel_event = None
 
     def _send_request(self):
         """APIリクエストを送信"""
@@ -1013,10 +1019,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """ウィンドウ終了時のクリーンアップ"""
+        # ワーカーが実行中ならキャンセル指示だけ出す（waitは_cleanup_workerに一元化）
+        if self.worker is not None and self.worker.isRunning():
+            if self.cancel_event:
+                self.cancel_event.set()
+
+        # _cleanup_workerでwaitを一元的に行う
         self._cleanup_worker()
 
         # モデル取得ワーカーもクリーンアップ
         if self.model_fetch_worker and self.model_fetch_worker.isRunning():
-            self.model_fetch_worker.wait(1000)
+            self.model_fetch_worker.wait(1500)
 
         super().closeEvent(event)
