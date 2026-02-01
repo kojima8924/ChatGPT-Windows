@@ -1,0 +1,6 @@
+# ChatGPT-Windows 依存パッケージ
+# Python 3.10以上推奨
+
+PySide6>=6.6.0          # Qt6 GUIフレームワーク
+openai>=1.0.0           # OpenAI API クライアント
+keyring>=24.0.0         # 安全な認証情報保存（Windows資格情報マネージャー）
