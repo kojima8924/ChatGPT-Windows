@@ -6,7 +6,7 @@ OpenAI Responses APIを使用してテキスト生成を行う。
 """
 
 from openai import OpenAI
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Any
 from dataclasses import dataclass
 
 
@@ -85,11 +85,93 @@ class ChatGPTClient:
                 return False
         return True
 
+    def _extract_delta_text(self, event: Any) -> str:
+        """
+        ストリーミングイベントからdelta文字列を安全に抽出
+
+        Args:
+            event: ストリーミングイベント
+
+        Returns:
+            str: 抽出されたテキスト（抽出できない場合は空文字列）
+        """
+        delta = getattr(event, 'delta', None)
+
+        if delta is None:
+            return ""
+
+        # delta が文字列の場合はそのまま返す
+        if isinstance(delta, str):
+            return delta
+
+        # delta が dict の場合は代表キーを探す
+        if isinstance(delta, dict):
+            # "text" キーを優先
+            if 'text' in delta:
+                text = delta['text']
+                return text if isinstance(text, str) else ""
+            # "content" キーを試す
+            if 'content' in delta:
+                content = delta['content']
+                return content if isinstance(content, str) else ""
+            return ""
+
+        # その他の型は空文字列
+        return ""
+
+    def _extract_output_text(self, response: Any) -> str:
+        """
+        Responses APIレスポンスからテキストを安全に抽出
+
+        Args:
+            response: APIレスポンス
+
+        Returns:
+            str: 抽出されたテキスト
+        """
+        # output_text を最優先で取得
+        output_text = getattr(response, 'output_text', None)
+        if output_text and isinstance(output_text, str):
+            return output_text
+
+        # fallback: output 配列から取得を試みる
+        output = getattr(response, 'output', None)
+        if not output or not isinstance(output, list):
+            return ""
+
+        # output の各要素を走査
+        for item in output:
+            # 直接 text を試す
+            text = getattr(item, 'text', None)
+            if text and isinstance(text, str):
+                return text
+
+            # content を試す（content が list の可能性がある）
+            content = getattr(item, 'content', None)
+            if content:
+                # content が文字列の場合
+                if isinstance(content, str):
+                    return content
+                # content が list の場合
+                if isinstance(content, list):
+                    for content_item in content:
+                        # 各要素の text を試す
+                        item_text = getattr(content_item, 'text', None)
+                        if item_text and isinstance(item_text, str):
+                            return item_text
+                        # dict の場合
+                        if isinstance(content_item, dict) and 'text' in content_item:
+                            t = content_item['text']
+                            if isinstance(t, str):
+                                return t
+
+        return ""
+
     def send_message(
         self,
         user_message: str,
         system_prompt: str = "",
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-5",
         temperature: float = 0.7,
         max_tokens: int = 1024,
         stream: bool = True,
@@ -171,10 +253,10 @@ class ChatGPTClient:
             ChatResponse: 完全なレスポンス
         """
         try:
-            # Responses API パラメータを構築
+            # Responses API パラメータを構築（role付き形式）
             api_params = {
                 'model': model,
-                'input': user_message,
+                'input': [{"role": "user", "content": user_message}],
                 'max_output_tokens': max_tokens,
             }
 
@@ -189,22 +271,12 @@ class ChatGPTClient:
             # Responses API を呼び出す
             response = self.client.responses.create(**api_params)
 
-            # output_text を優先して取得
-            content = getattr(response, 'output_text', None)
-
-            # fallback: output 配列から取得を試みる
-            if content is None:
-                output = getattr(response, 'output', None)
-                if output and isinstance(output, list) and len(output) > 0:
-                    first_output = output[0]
-                    content = getattr(first_output, 'content', None)
-                    if content is None:
-                        # さらに text を試す
-                        content = getattr(first_output, 'text', None)
+            # 堅牢なテキスト抽出
+            content = self._extract_output_text(response)
 
             return ChatResponse(
                 success=True,
-                content=content or ""
+                content=content
             )
 
         except Exception as e:
@@ -238,10 +310,10 @@ class ChatGPTClient:
             ChatResponse: 完全なレスポンス
         """
         try:
-            # Responses API パラメータを構築
+            # Responses API パラメータを構築（role付き形式）
             api_params = {
                 'model': model,
-                'input': user_message,
+                'input': [{"role": "user", "content": user_message}],
                 'max_output_tokens': max_tokens,
                 'stream': True,
             }
@@ -264,8 +336,8 @@ class ChatGPTClient:
                 event_type = getattr(event, 'type', None)
 
                 if event_type == "response.output_text.delta":
-                    # delta 文字列を取得
-                    delta = getattr(event, 'delta', None) or ""
+                    # 堅牢なdelta抽出
+                    delta = self._extract_delta_text(event)
                     if delta:
                         full_content += delta
 

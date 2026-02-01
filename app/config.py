@@ -32,6 +32,7 @@ KEYRING_USERNAME = "openai_api_key"
 # 利用可能なモデルリスト
 # ============================================
 AVAILABLE_MODELS: List[str] = [
+    "gpt-5",
     "gpt-4o-mini",
     "gpt-4o",
     "gpt-4-turbo",
@@ -102,7 +103,7 @@ class AppConfig:
         active_preset_index: 現在選択中のプリセットインデックス（-1はカスタム）
     """
     api_key: str = ""
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-5"
     system_prompt: str = ""
     temperature: float = 0.7
     max_tokens: int = 1024

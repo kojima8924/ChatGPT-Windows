@@ -703,7 +703,11 @@ class MainWindow(QMainWindow):
 
     def _save_config(self):
         """現在のUI設定を保存"""
-        self.config.api_key = self.api_key_input.text()
+        # APIキー入力欄が空でない場合のみ更新（空で保存するとkeyringから消えるのを防止）
+        api_key_text = self.api_key_input.text().strip()
+        if api_key_text:
+            self.config.api_key = api_key_text
+
         self.config.model = self.model_combo.currentText()
         self.config.system_prompt = self.system_prompt_input.toPlainText()
         self.config.temperature = self.temp_spin.value()
