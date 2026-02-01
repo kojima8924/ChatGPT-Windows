@@ -12,13 +12,226 @@ from PySide6.QtWidgets import (
     QTextEdit, QPushButton, QLabel, QLineEdit,
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QGroupBox, QSplitter, QMessageBox, QApplication,
-    QSizePolicy
+    QSizePolicy, QDialog, QListWidget, QListWidgetItem,
+    QDialogButtonBox, QFormLayout, QScrollArea, QFrame
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QFont, QClipboard
 
-from app.config import AppConfig, load_config, save_config, is_api_key_pattern
+from app.config import (
+    AppConfig, load_config, save_config, is_api_key_pattern,
+    AVAILABLE_MODELS, MAX_TOKENS_LIMIT, PromptPreset, DEFAULT_PRESETS
+)
 from app.api.openai_client import ChatGPTClient, ChatResponse
+
+
+class PresetEditorDialog(QDialog):
+    """
+    プリセット編集ダイアログ
+
+    プリセットの追加、編集、削除、並べ替えを行う。
+    """
+
+    def __init__(self, presets: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("プリセット編集")
+        self.setMinimumSize(500, 400)
+        self.resize(600, 500)
+
+        # プリセットのコピーを作成
+        self.presets = [dict(p) for p in presets]
+        self.selected_index = -1
+
+        self._setup_ui()
+        self._update_list()
+
+    def _setup_ui(self):
+        """UIを構築"""
+        layout = QHBoxLayout(self)
+
+        # 左側: プリセットリスト
+        left_layout = QVBoxLayout()
+
+        self.preset_list = QListWidget()
+        self.preset_list.currentRowChanged.connect(self._on_selection_changed)
+        left_layout.addWidget(self.preset_list)
+
+        # リスト操作ボタン
+        list_btn_layout = QHBoxLayout()
+
+        self.add_btn = QPushButton("追加")
+        self.add_btn.clicked.connect(self._add_preset)
+        list_btn_layout.addWidget(self.add_btn)
+
+        self.remove_btn = QPushButton("削除")
+        self.remove_btn.clicked.connect(self._remove_preset)
+        list_btn_layout.addWidget(self.remove_btn)
+
+        self.up_btn = QPushButton("↑")
+        self.up_btn.setMaximumWidth(40)
+        self.up_btn.clicked.connect(self._move_up)
+        list_btn_layout.addWidget(self.up_btn)
+
+        self.down_btn = QPushButton("↓")
+        self.down_btn.setMaximumWidth(40)
+        self.down_btn.clicked.connect(self._move_down)
+        list_btn_layout.addWidget(self.down_btn)
+
+        left_layout.addLayout(list_btn_layout)
+        layout.addLayout(left_layout, 1)
+
+        # 右側: 編集フォーム
+        right_layout = QVBoxLayout()
+
+        form_group = QGroupBox("プリセット編集")
+        form_layout = QFormLayout(form_group)
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("ボタンに表示する名前")
+        self.name_input.textChanged.connect(self._on_name_changed)
+        form_layout.addRow("名前:", self.name_input)
+
+        self.prompt_input = QTextEdit()
+        self.prompt_input.setPlaceholderText("システムプロンプトの内容")
+        self.prompt_input.textChanged.connect(self._on_prompt_changed)
+        form_layout.addRow("プロンプト:", self.prompt_input)
+
+        right_layout.addWidget(form_group)
+
+        # デフォルトに戻すボタン
+        self.reset_btn = QPushButton("デフォルトに戻す")
+        self.reset_btn.clicked.connect(self._reset_to_default)
+        right_layout.addWidget(self.reset_btn)
+
+        layout.addLayout(right_layout, 2)
+
+        # ダイアログボタン
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(layout)
+        main_layout.addWidget(button_box)
+        self.setLayout(main_layout)
+
+    def _update_list(self):
+        """リストを更新"""
+        self.preset_list.clear()
+        for preset in self.presets:
+            self.preset_list.addItem(preset["name"])
+
+        # 選択状態を復元
+        if 0 <= self.selected_index < len(self.presets):
+            self.preset_list.setCurrentRow(self.selected_index)
+        elif self.presets:
+            self.preset_list.setCurrentRow(0)
+
+        self._update_buttons()
+
+    def _update_buttons(self):
+        """ボタンの有効/無効を更新"""
+        has_selection = self.selected_index >= 0
+        can_remove = len(self.presets) > 1
+
+        self.remove_btn.setEnabled(has_selection and can_remove)
+        self.up_btn.setEnabled(has_selection and self.selected_index > 0)
+        self.down_btn.setEnabled(
+            has_selection and self.selected_index < len(self.presets) - 1
+        )
+        self.name_input.setEnabled(has_selection)
+        self.prompt_input.setEnabled(has_selection)
+
+    def _on_selection_changed(self, index: int):
+        """選択変更時の処理"""
+        self.selected_index = index
+
+        if 0 <= index < len(self.presets):
+            preset = self.presets[index]
+            # シグナルを一時的にブロック
+            self.name_input.blockSignals(True)
+            self.prompt_input.blockSignals(True)
+
+            self.name_input.setText(preset["name"])
+            self.prompt_input.setPlainText(preset["prompt"])
+
+            self.name_input.blockSignals(False)
+            self.prompt_input.blockSignals(False)
+        else:
+            self.name_input.clear()
+            self.prompt_input.clear()
+
+        self._update_buttons()
+
+    def _on_name_changed(self, text: str):
+        """名前変更時の処理"""
+        if 0 <= self.selected_index < len(self.presets):
+            self.presets[self.selected_index]["name"] = text
+            # リストアイテムのテキストを更新
+            item = self.preset_list.item(self.selected_index)
+            if item:
+                item.setText(text)
+
+    def _on_prompt_changed(self):
+        """プロンプト変更時の処理"""
+        if 0 <= self.selected_index < len(self.presets):
+            self.presets[self.selected_index]["prompt"] = \
+                self.prompt_input.toPlainText()
+
+    def _add_preset(self):
+        """プリセットを追加"""
+        new_preset = {
+            "name": f"プリセット{len(self.presets) + 1}",
+            "prompt": ""
+        }
+        self.presets.append(new_preset)
+        self.selected_index = len(self.presets) - 1
+        self._update_list()
+
+    def _remove_preset(self):
+        """プリセットを削除"""
+        if 0 <= self.selected_index < len(self.presets) and len(self.presets) > 1:
+            del self.presets[self.selected_index]
+            if self.selected_index >= len(self.presets):
+                self.selected_index = len(self.presets) - 1
+            self._update_list()
+
+    def _move_up(self):
+        """プリセットを上に移動"""
+        if self.selected_index > 0:
+            idx = self.selected_index
+            self.presets[idx], self.presets[idx - 1] = \
+                self.presets[idx - 1], self.presets[idx]
+            self.selected_index -= 1
+            self._update_list()
+
+    def _move_down(self):
+        """プリセットを下に移動"""
+        if self.selected_index < len(self.presets) - 1:
+            idx = self.selected_index
+            self.presets[idx], self.presets[idx + 1] = \
+                self.presets[idx + 1], self.presets[idx]
+            self.selected_index += 1
+            self._update_list()
+
+    def _reset_to_default(self):
+        """デフォルトプリセットに戻す"""
+        reply = QMessageBox.question(
+            self,
+            "確認",
+            "プリセットをデフォルトに戻しますか？\n現在の変更は失われます。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.presets = [dict(p) for p in DEFAULT_PRESETS]
+            self.selected_index = 0
+            self._update_list()
+
+    def get_presets(self) -> list:
+        """編集後のプリセットリストを取得"""
+        return self.presets
 
 
 class ApiWorker(QThread):
@@ -77,6 +290,9 @@ class MainWindow(QMainWindow):
         self.client: ChatGPTClient = None
         self.worker: ApiWorker = None
 
+        # プリセットボタンのリスト
+        self.preset_buttons: list = []
+
         # UIを構築
         self._setup_ui()
 
@@ -95,8 +311,8 @@ class MainWindow(QMainWindow):
 
         # ウィンドウ設定
         self.setWindowTitle("ChatGPT Desktop")
-        self.setMinimumSize(500, 600)
-        self.resize(600, 700)
+        self.setMinimumSize(500, 650)
+        self.resize(650, 750)
 
         # 中央ウィジェット
         central = QWidget()
@@ -125,15 +341,10 @@ class MainWindow(QMainWindow):
         # モデル選択とパラメータ
         params_layout = QHBoxLayout()
 
-        # モデル選択
+        # モデル選択（定数から読み込み）
         params_layout.addWidget(QLabel("モデル:"))
         self.model_combo = QComboBox()
-        self.model_combo.addItems([
-            "gpt-4o-mini",
-            "gpt-4o",
-            "gpt-4-turbo",
-            "gpt-3.5-turbo"
-        ])
+        self.model_combo.addItems(AVAILABLE_MODELS)
         self.model_combo.setEditable(True)  # カスタムモデル入力可能
         params_layout.addWidget(self.model_combo)
 
@@ -149,10 +360,10 @@ class MainWindow(QMainWindow):
 
         params_layout.addSpacing(20)
 
-        # 最大トークン
+        # 最大トークン（上限を拡大）
         params_layout.addWidget(QLabel("最大トークン:"))
         self.tokens_spin = QSpinBox()
-        self.tokens_spin.setRange(1, 4096)
+        self.tokens_spin.setRange(1, MAX_TOKENS_LIMIT)
         self.tokens_spin.setValue(1024)
         params_layout.addWidget(self.tokens_spin)
 
@@ -180,16 +391,45 @@ class MainWindow(QMainWindow):
         layout.addWidget(settings_group)
 
         # ============================================
-        # システムプロンプト
+        # システムプロンプト（プリセット付き）
         # ============================================
         prompt_group = QGroupBox("システムプロンプト（AIへの指示）")
         prompt_layout = QVBoxLayout(prompt_group)
 
+        # プリセットボタン行
+        preset_header = QHBoxLayout()
+
+        # スクロール可能なプリセットボタンエリア
+        self.preset_scroll = QScrollArea()
+        self.preset_scroll.setWidgetResizable(True)
+        self.preset_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.preset_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.preset_scroll.setMaximumHeight(50)
+        self.preset_scroll.setFrameShape(QFrame.NoFrame)
+
+        self.preset_container = QWidget()
+        self.preset_btn_layout = QHBoxLayout(self.preset_container)
+        self.preset_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.preset_btn_layout.setSpacing(4)
+
+        self.preset_scroll.setWidget(self.preset_container)
+        preset_header.addWidget(self.preset_scroll, 1)
+
+        # 編集ボタン
+        self.edit_preset_btn = QPushButton("編集")
+        self.edit_preset_btn.setMaximumWidth(60)
+        self.edit_preset_btn.clicked.connect(self._open_preset_editor)
+        preset_header.addWidget(self.edit_preset_btn)
+
+        prompt_layout.addLayout(preset_header)
+
+        # システムプロンプト入力
         self.system_prompt_input = QTextEdit()
         self.system_prompt_input.setMaximumHeight(80)
         self.system_prompt_input.setPlaceholderText(
             "例: あなたは優秀な翻訳者です。入力された文章を日本語に翻訳してください。"
         )
+        self.system_prompt_input.textChanged.connect(self._on_prompt_manually_changed)
         prompt_layout.addWidget(self.system_prompt_input)
 
         layout.addWidget(prompt_group)
@@ -301,6 +541,92 @@ class MainWindow(QMainWindow):
         # Ctrl+Enter で送信
         self.input_text.installEventFilter(self)
 
+    def _create_preset_buttons(self):
+        """プリセットボタンを作成"""
+        # 既存のボタンをクリア
+        for btn in self.preset_buttons:
+            btn.deleteLater()
+        self.preset_buttons.clear()
+
+        # 新しいボタンを作成
+        for i, preset in enumerate(self.config.presets):
+            btn = QPushButton(preset["name"])
+            btn.setCheckable(True)
+            btn.setMinimumWidth(60)
+            btn.clicked.connect(lambda checked, idx=i: self._on_preset_clicked(idx))
+
+            # スタイル設定
+            btn.setStyleSheet("""
+                QPushButton {
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                }
+                QPushButton:checked {
+                    background-color: #3b82f6;
+                    color: white;
+                }
+            """)
+
+            self.preset_btn_layout.addWidget(btn)
+            self.preset_buttons.append(btn)
+
+        # ストレッチを追加
+        self.preset_btn_layout.addStretch()
+
+        # アクティブなプリセットを選択
+        self._update_preset_button_states()
+
+    def _update_preset_button_states(self):
+        """プリセットボタンの選択状態を更新"""
+        for i, btn in enumerate(self.preset_buttons):
+            btn.setChecked(i == self.config.active_preset_index)
+
+    def _on_preset_clicked(self, index: int):
+        """プリセットボタンがクリックされた時の処理"""
+        if 0 <= index < len(self.config.presets):
+            self.config.active_preset_index = index
+            preset = self.config.presets[index]
+
+            # システムプロンプトを更新（シグナルをブロック）
+            self.system_prompt_input.blockSignals(True)
+            self.system_prompt_input.setPlainText(preset["prompt"])
+            self.system_prompt_input.blockSignals(False)
+
+            self.config.system_prompt = preset["prompt"]
+            self._update_preset_button_states()
+            self._set_status(f"プリセット「{preset['name']}」を選択", "green")
+
+    def _on_prompt_manually_changed(self):
+        """システムプロンプトが手動で変更された時の処理"""
+        current_text = self.system_prompt_input.toPlainText()
+
+        # 現在のプリセットと一致するかチェック
+        if 0 <= self.config.active_preset_index < len(self.config.presets):
+            preset_prompt = self.config.presets[self.config.active_preset_index]["prompt"]
+            if current_text != preset_prompt:
+                # カスタム状態に変更
+                self.config.active_preset_index = -1
+                self._update_preset_button_states()
+
+        self.config.system_prompt = current_text
+
+    def _open_preset_editor(self):
+        """プリセット編集ダイアログを開く"""
+        dialog = PresetEditorDialog(self.config.presets, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.config.presets = dialog.get_presets()
+
+            # アクティブインデックスを調整
+            if self.config.active_preset_index >= len(self.config.presets):
+                self.config.active_preset_index = 0
+
+            # ボタンを再作成
+            self._create_preset_buttons()
+
+            # 設定を保存
+            self._save_config()
+            self._set_status("プリセットを更新しました", "green")
+
     def eventFilter(self, obj, event):
         """キーボードショートカットを処理"""
         from PySide6.QtCore import QEvent
@@ -321,6 +647,9 @@ class MainWindow(QMainWindow):
         self.tokens_spin.setValue(self.config.max_tokens)
         self.always_on_top_check.setChecked(self.config.always_on_top)
         self.auto_paste_check.setChecked(self.config.auto_paste)
+
+        # プリセットボタンを作成
+        self._create_preset_buttons()
 
         # 常に最前面を適用
         self._toggle_always_on_top(self.config.always_on_top)
@@ -348,9 +677,37 @@ class MainWindow(QMainWindow):
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
         self.show()  # フラグ変更後に再表示が必要
 
+    def _get_clipboard_text(self) -> str:
+        """
+        クリップボードからテキストを安全に取得
+
+        Returns:
+            str: クリップボードのテキスト（取得失敗時は空文字列）
+        """
+        try:
+            return self.clipboard.text() or ""
+        except Exception:
+            return ""
+
+    def _set_clipboard_text(self, text: str) -> bool:
+        """
+        クリップボードにテキストを安全に設定
+
+        Args:
+            text: 設定するテキスト
+
+        Returns:
+            bool: 設定に成功した場合True
+        """
+        try:
+            self.clipboard.setText(text)
+            return True
+        except Exception:
+            return False
+
     def _auto_paste_from_clipboard(self):
         """起動時の自動貼り付け（APIキーはスキップ）"""
-        text = self.clipboard.text()
+        text = self._get_clipboard_text()
         if text:
             # APIキーのパターンの場合はスキップ
             if is_api_key_pattern(text):
@@ -361,7 +718,7 @@ class MainWindow(QMainWindow):
 
     def _paste_from_clipboard(self):
         """クリップボードからテキストを貼り付け（手動）"""
-        text = self.clipboard.text()
+        text = self._get_clipboard_text()
         if text:
             # APIキーのパターンの場合は警告
             if is_api_key_pattern(text):
@@ -376,10 +733,25 @@ class MainWindow(QMainWindow):
         """出力テキストをクリップボードにコピー"""
         text = self.output_text.toPlainText()
         if text:
-            self.clipboard.setText(text)
-            self._set_status("クリップボードにコピーしました", "green")
+            if self._set_clipboard_text(text):
+                self._set_status("クリップボードにコピーしました", "green")
+            else:
+                self._set_status("クリップボードへのコピーに失敗しました", "red")
         else:
             self._set_status("コピーするテキストがありません", "orange")
+
+    def _cleanup_worker(self):
+        """古いワーカースレッドをクリーンアップ"""
+        if self.worker is not None:
+            # シグナル接続を解除
+            try:
+                self.worker.finished.disconnect()
+            except RuntimeError:
+                pass  # すでに接続解除されている場合
+            # スレッドが終了するまで待機（タイムアウト付き）
+            if self.worker.isRunning():
+                self.worker.wait(1000)  # 最大1秒待機
+            self.worker = None
 
     def _send_request(self):
         """APIリクエストを送信"""
@@ -399,6 +771,9 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             return
 
+        # 古いワーカーをクリーンアップ
+        self._cleanup_worker()
+
         # クライアント作成
         self.client = ChatGPTClient(api_key)
 
@@ -416,7 +791,8 @@ class MainWindow(QMainWindow):
             temperature=self.temp_spin.value(),
             max_tokens=self.tokens_spin.value()
         )
-        self.worker.finished.connect(self._on_response)
+        # UniqueConnectionで重複接続を防止
+        self.worker.finished.connect(self._on_response, Qt.UniqueConnection)
         self.worker.start()
 
     def _on_response(self, response: ChatResponse):
@@ -443,3 +819,8 @@ class MainWindow(QMainWindow):
         }
         self.status_label.setText(message)
         self.status_label.setStyleSheet(f"color: {color_map.get(color, color)};")
+
+    def closeEvent(self, event):
+        """ウィンドウ終了時のクリーンアップ"""
+        self._cleanup_worker()
+        super().closeEvent(event)
