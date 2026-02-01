@@ -15,10 +15,15 @@ from PySide6.QtWidgets import (
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QGroupBox, QSplitter, QMessageBox, QApplication,
     QSizePolicy, QDialog, QListWidget, QListWidgetItem,
-    QDialogButtonBox, QFormLayout, QScrollArea, QFrame
+    QDialogButtonBox, QFormLayout, QScrollArea, QFrame,
+    QSystemTrayIcon, QMenu
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QClipboard, QTextCursor
+from PySide6.QtGui import QFont, QClipboard, QTextCursor, QIcon, QAction
+
+import ctypes  # グローバルホットキー用 (Win32 API)
+from ctypes import wintypes
+import subprocess  # プロセス終了用
 
 from app.config import (
     AppConfig, load_config, save_config, is_api_key_pattern, get_api_key,
@@ -335,6 +340,10 @@ class MainWindow(QMainWindow):
         # プリセットボタンのリスト
         self.preset_buttons: list = []
 
+        # ストリーミング出力のバッファリング用
+        self._chunk_buffer: list = []
+        self._flush_timer: QTimer = None
+
         # UIを構築
         self._setup_ui()
 
@@ -350,6 +359,12 @@ class MainWindow(QMainWindow):
 
         # モデルリストを動的に取得（非同期）
         QTimer.singleShot(200, self._fetch_models)
+
+        # システムトレイ設定
+        self._setup_system_tray()
+
+        # グローバルホットキー設定（Ctrl+Alt+C）
+        self._setup_global_hotkey()
 
     def _setup_ui(self):
         """UIコンポーネントを構築"""
@@ -730,9 +745,9 @@ class MainWindow(QMainWindow):
 
     def _apply_config(self):
         """設定をUIに反映"""
-        # APIキーは自動表示しない（ユーザーが入力した場合のみ表示）
-        # 環境変数やkeyringから取得したキーは送信時に使用
-        # self.api_key_input.setText(self.config.api_key)
+        # APIキーが保存済みの場合は ******** を表示
+        if self.config.api_key:
+            self.api_key_input.setText("********")
         self.model_combo.setCurrentText(self.config.model)
         self.system_prompt_input.setPlainText(self.config.system_prompt)
         self.temp_spin.setValue(self.config.temperature)
@@ -748,12 +763,16 @@ class MainWindow(QMainWindow):
 
     def _save_config(self):
         """現在のUI設定を保存"""
-        # APIキー入力欄が空でない場合のみ更新（空で保存するとkeyringから消えるのを防止）
+        # APIキー入力欄が空でなく、placeholder(********)でない場合のみ更新
         api_key_text = self.api_key_input.text().strip()
-        if api_key_text:
+        if api_key_text and api_key_text != "********":
             self.config.api_key = api_key_text
 
-        self.config.model = self.model_combo.currentText()
+        # モデル名を保存（placeholder以外）
+        current_model = self.model_combo.currentText()
+        if not current_model.startswith("("):
+            self.config.model = current_model
+
         self.config.system_prompt = self.system_prompt_input.toPlainText()
         self.config.temperature = self.temp_spin.value()
         self.config.max_tokens = self.tokens_spin.value()
@@ -762,18 +781,24 @@ class MainWindow(QMainWindow):
 
         if save_config(self.config):
             self._set_status("設定を保存しました", "green")
-            # 保存成功時にAPIキー入力欄をクリア（覗き見耐性向上）
-            self.api_key_input.clear()
+            # 保存成功時にAPIキー入力欄を ******** に戻す（保存済み表示）
+            if self.config.api_key:
+                self.api_key_input.setText("********")
+            else:
+                self.api_key_input.clear()
         else:
             self._set_status("設定の保存に失敗しました", "red")
 
     def _toggle_always_on_top(self, checked: bool):
         """常に最前面の切り替え"""
+        was_visible = self.isVisible()
         if checked:
             self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         else:
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
-        self.show()  # フラグ変更後に再表示が必要
+        # フラグ変更後、表示中だった場合のみ再表示（--hidden対応）
+        if was_visible:
+            self.show()
 
     def _get_clipboard_text(self) -> str:
         """
@@ -925,20 +950,45 @@ class MainWindow(QMainWindow):
         if self.cancel_event:
             self.cancel_event.set()
             self.stop_btn.setEnabled(False)
+            # バッファに残ったチャンクを出力してタイマー停止
+            self._stop_flush_timer()
             self._set_status("キャンセル中...", "orange")
 
     def _on_chunk(self, chunk_text: str):
-        """ストリーミングチャンクを受信した時の処理"""
-        # 現在のカーソル位置を保持
+        """ストリーミングチャンクを受信した時の処理（バッファに蓄積）"""
+        self._chunk_buffer.append(chunk_text)
+        # タイマーが未起動なら開始（50ms間隔で flush）
+        if self._flush_timer is None:
+            self._flush_timer = QTimer(self)
+            self._flush_timer.timeout.connect(self._flush_chunk_buffer)
+            self._flush_timer.start(50)
+
+    def _flush_chunk_buffer(self):
+        """バッファに溜まったチャンクをまとめて出力"""
+        if not self._chunk_buffer:
+            return
+        # バッファを結合してクリア
+        text = ''.join(self._chunk_buffer)
+        self._chunk_buffer.clear()
+        # まとめて挿入
         cursor = self.output_text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(chunk_text)
+        cursor.insertText(text)
         self.output_text.setTextCursor(cursor)
-        # 自動スクロール
         self.output_text.ensureCursorVisible()
+
+    def _stop_flush_timer(self):
+        """flush タイマーを停止し、残りのバッファを出力"""
+        if self._flush_timer is not None:
+            self._flush_timer.stop()
+            self._flush_timer = None
+        # 残りを flush
+        self._flush_chunk_buffer()
 
     def _on_response(self, response: ChatResponse):
         """APIレスポンスを受信した時の処理（ストリーミング完了時）"""
+        # バッファに残ったチャンクを出力してタイマー停止
+        self._stop_flush_timer()
         # UIを通常状態に戻す（全要素を有効化）
         self.send_btn.setEnabled(True)
         self.send_btn.setText("送信 (Ctrl+Enter)")
@@ -982,7 +1032,10 @@ class MainWindow(QMainWindow):
             api_key = get_api_key()
 
         if not api_key:
-            # APIキーがない場合はデフォルトリストを使用
+            # APIキーがない場合はコンボを無効化し placeholder 表示
+            self.model_combo.clear()
+            self.model_combo.addItem("(APIキー設定後に取得)")
+            self.model_combo.setEnabled(False)
             return
 
         # 既にワーカーが実行中の場合はスキップ
@@ -997,12 +1050,15 @@ class MainWindow(QMainWindow):
     def _on_models_fetched(self, models):
         """モデルリスト取得完了時の処理"""
         if models and len(models) > 0:
-            # 現在選択されているモデルを保持
+            # 現在選択されているモデルを保持（placeholder除外）
             current_model = self.model_combo.currentText()
+            if current_model.startswith("("):
+                current_model = self.config.model  # 設定から復元
 
-            # コンボボックスを更新
+            # コンボボックスを更新・有効化
             self.model_combo.clear()
             self.model_combo.addItems(models)
+            self.model_combo.setEnabled(True)
 
             # 以前のモデルが新しいリストにあれば選択を維持
             index = self.model_combo.findText(current_model)
@@ -1014,21 +1070,141 @@ class MainWindow(QMainWindow):
 
             self._set_status(f"モデルリストを更新しました（{len(models)}件）", "green")
         else:
-            # 取得失敗時はデフォルトリストを維持（何もしない）
+            # 取得失敗時はデフォルトリストにフォールバック
+            self.model_combo.clear()
+            self.model_combo.addItems(AVAILABLE_MODELS)
+            self.model_combo.setEnabled(True)
             self._set_status("モデルリスト取得失敗、デフォルトを使用", "orange")
 
+    def _setup_system_tray(self):
+        """システムトレイを設定"""
+        self.tray_icon = QSystemTrayIcon(self)
+
+        # アイコン設定（デフォルトアイコンを使用）
+        icon = self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon)
+        self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("ChatGPT Desktop (Ctrl+Alt+V)")
+
+        # トレイメニュー
+        tray_menu = QMenu()
+
+        show_action = QAction("表示", self)
+        show_action.triggered.connect(self._show_window)
+        tray_menu.addAction(show_action)
+
+        tray_menu.addSeparator()
+
+        quit_action = QAction("終了", self)
+        quit_action.triggered.connect(self._quit_app)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _setup_global_hotkey(self):
+        """グローバルホットキーを設定 (Win32 RegisterHotKey)"""
+        # ホットキーID
+        self._hotkey_id = 1
+        # 修飾キー: MOD_CONTROL=0x0002, MOD_ALT=0x0001
+        MOD_CONTROL = 0x0002
+        MOD_ALT = 0x0001
+        # 仮想キーコード: 'V' = 0x56
+        VK_V = 0x56
+
+        # winId() を呼んでウィンドウハンドルを確保
+        hwnd = int(self.winId())
+
+        # RegisterHotKey(hwnd, id, fsModifiers, vk)
+        result = ctypes.windll.user32.RegisterHotKey(
+            hwnd, self._hotkey_id, MOD_CONTROL | MOD_ALT, VK_V
+        )
+        if not result:
+            err = ctypes.windll.kernel32.GetLastError()
+            self._set_status(f"ホットキー登録失敗 (err={err})", "orange")
+
+    def nativeEvent(self, eventType, message):
+        """Qt の nativeEvent で WM_HOTKEY を受信"""
+        # Windows の場合のみ処理（str/bytes 両対応）
+        if eventType == "windows_generic_MSG" or eventType == b"windows_generic_MSG":
+            # message を MSG 構造体に変換
+            msg = wintypes.MSG.from_address(int(message))
+            # WM_HOTKEY = 0x0312
+            if msg.message == 0x0312 and msg.wParam == self._hotkey_id:
+                # UI スレッドで安全に実行
+                QTimer.singleShot(0, self._toggle_window)
+                return True, 0  # イベント処理済み
+        return super().nativeEvent(eventType, message)
+
+    def _unregister_hotkey(self):
+        """ホットキーを解除"""
+        if hasattr(self, '_hotkey_id'):
+            try:
+                ctypes.windll.user32.UnregisterHotKey(int(self.winId()), self._hotkey_id)
+            except Exception:
+                pass
+
+    def _toggle_window(self):
+        """ウィンドウの表示/非表示をトグル"""
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self._show_window()
+
+    def _show_window(self):
+        """ウィンドウを表示してアクティブ化"""
+        # 他のChatGPT-Webプロセスを終了
+        self._kill_chatgpt_web()
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+        # 自動貼り付けが有効なら実行
+        if self.config.auto_paste:
+            QTimer.singleShot(100, self._auto_paste_from_clipboard)
+
+    def _kill_chatgpt_web(self):
+        """ChatGPT-Web プロセスを終了"""
+        try:
+            # taskkill /F /T でツリーごと強制終了
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", "ChatGPT-Web.exe"],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass  # 失敗しても無視
+
+    def _on_tray_activated(self, reason):
+        """トレイアイコンがアクティブ化された時"""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._show_window()
+
+    def _quit_app(self):
+        """アプリケーションを終了"""
+        self._force_quit = True
+        self._unregister_hotkey()
+        self.tray_icon.hide()
+        QApplication.quit()
+
     def closeEvent(self, event):
-        """ウィンドウ終了時のクリーンアップ"""
-        # ワーカーが実行中ならキャンセル指示だけ出す（waitは_cleanup_workerに一元化）
-        if self.worker is not None and self.worker.isRunning():
-            if self.cancel_event:
-                self.cancel_event.set()
+        """ウィンドウ終了時の処理"""
+        # 強制終了フラグがある場合はクリーンアップして終了
+        if getattr(self, '_force_quit', False):
+            # ホットキー解除
+            self._unregister_hotkey()
 
-        # _cleanup_workerでwaitを一元的に行う
-        self._cleanup_worker()
+            # ワーカーが実行中ならキャンセル指示だけ出す
+            if self.worker is not None and self.worker.isRunning():
+                if self.cancel_event:
+                    self.cancel_event.set()
 
-        # モデル取得ワーカーもクリーンアップ
-        if self.model_fetch_worker and self.model_fetch_worker.isRunning():
-            self.model_fetch_worker.wait(1500)
+            self._cleanup_worker()
 
-        super().closeEvent(event)
+            if self.model_fetch_worker and self.model_fetch_worker.isRunning():
+                self.model_fetch_worker.wait(1500)
+
+            super().closeEvent(event)
+        else:
+            # 通常の閉じるボタンは非表示にするだけ
+            event.ignore()
+            self.hide()

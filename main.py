@@ -19,16 +19,104 @@ from PySide6.QtCore import Qt
 from app.window import MainWindow
 
 
+# ============================================
+# 1インスタンス化 (Windows専用)
+# ============================================
+MUTEX_NAME = "Global\\ChatGPT-Windows-SingleInstance"
+WINDOW_TITLE = "ChatGPT Desktop"
+
+
+def _acquire_single_instance_mutex():
+    """
+    Named Mutex を取得して1インスタンス化を実現する (Windows専用)
+
+    Returns:
+        mutex ハンドル（成功時）、None（既に起動中 or 非Windows）
+    """
+    if sys.platform != "win32":
+        return "non-windows"  # 非Windowsは常に成功扱い
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+
+    # CreateMutexW(lpMutexAttributes, bInitialOwner, lpName)
+    mutex = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    if not mutex:
+        return None  # 失敗時は従来通り起動
+
+    # ERROR_ALREADY_EXISTS = 183
+    if kernel32.GetLastError() == 183:
+        kernel32.CloseHandle(mutex)
+        return None  # 既に起動中
+
+    return mutex
+
+
+def _activate_existing_window():
+    """
+    既存のウィンドウを探して前面に出す (Windows専用)
+    hidden ウィンドウは前面化しない（visible の場合のみ）
+    """
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+
+    # コールバック用の型定義
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    found_hwnd = None
+
+    def enum_callback(hwnd, lparam):
+        nonlocal found_hwnd
+        # ウィンドウタイトルを取得
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length > 0:
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            if buffer.value == WINDOW_TITLE:
+                found_hwnd = hwnd
+                return False  # 列挙を停止
+        return True  # 列挙を続行
+
+    try:
+        user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+
+        if found_hwnd:
+            # visible の場合のみ前面化（hidden は無視）
+            if user32.IsWindowVisible(found_hwnd):
+                user32.ShowWindow(found_hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(found_hwnd)
+    except Exception:
+        pass  # 失敗しても黙って終了
+
+
 def main():
     """アプリケーションのエントリーポイント"""
+
+    # 1インスタンス化: Mutex取得を試みる
+    mutex = _acquire_single_instance_mutex()
+    if mutex is None:
+        # 既に起動中: 既存ウィンドウを前面に出して終了
+        _activate_existing_window()
+        sys.exit(0)
+
+    # コマンドライン引数解析
+    hidden = '--hidden' in sys.argv
 
     # High DPI対応
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
 
-    # アプリケーション作成
-    app = QApplication(sys.argv)
+    # アプリケーション作成（--hiddenを除外して渡す）
+    qt_args = [arg for arg in sys.argv if arg != '--hidden']
+    app = QApplication(qt_args)
 
     # アプリケーション情報
     app.setApplicationName("ChatGPT Desktop")
@@ -161,9 +249,12 @@ def main():
         }
     """)
 
-    # メインウィンドウ作成・表示
+    # メインウィンドウ作成
     window = MainWindow()
-    window.show()
+
+    # --hidden オプションがなければウィンドウを表示
+    if not hidden:
+        window.show()
 
     # イベントループ開始
     sys.exit(app.exec())
