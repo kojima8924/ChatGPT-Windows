@@ -78,8 +78,8 @@ class ChatGPTClient:
         Returns:
             bool: temperature をサポートする場合 True
         """
-        # o1, o3 シリーズは temperature をサポートしない（推論モデル）
-        no_temp_prefixes = ['o1-', 'o3-']
+        # o1, o3, gpt-5 シリーズは temperature をサポートしない（推論モデル）
+        no_temp_prefixes = ['o1-', 'o3-', 'gpt-5', 'gpt5']
         for prefix in no_temp_prefixes:
             if model.startswith(prefix):
                 return False
