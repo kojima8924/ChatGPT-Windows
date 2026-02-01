@@ -2,11 +2,11 @@
 OpenAI API クライアントモジュール
 
 ChatGPT APIとの通信を担当する。
-非同期処理でUIをブロックしないようにする。
+ストリーミングレスポンスに対応し、UIをブロックしないようにする。
 """
 
 from openai import OpenAI
-from typing import Optional, Callable
+from typing import Optional, Callable, Iterator, List
 from dataclasses import dataclass
 
 
@@ -29,7 +29,8 @@ class ChatGPTClient:
     """
     ChatGPT APIクライアント
 
-    OpenAI APIを使用してテキスト生成を行う。
+    OpenAI Responses APIを使用してテキスト生成を行う。
+    ストリーミングとノンストリーミングの両方に対応。
     """
 
     def __init__(self, api_key: str):
@@ -42,6 +43,23 @@ class ChatGPTClient:
         self.client = OpenAI(api_key=api_key)
         self.api_key = api_key
 
+    def _get_max_tokens_param(self, model: str) -> str:
+        """
+        モデルに応じて適切なmax_tokensパラメータ名を返す
+
+        Args:
+            model: モデル名
+
+        Returns:
+            str: 'max_tokens' または 'max_completion_tokens'
+        """
+        # 新しいモデル（gpt-4o, gpt-5, o1シリーズなど）はmax_completion_tokensを使用
+        new_models = ['gpt-4o', 'gpt-5', 'o1-', 'o3-']
+        for prefix in new_models:
+            if model.startswith(prefix):
+                return 'max_completion_tokens'
+        return 'max_tokens'
+
     def send_message(
         self,
         user_message: str,
@@ -49,6 +67,8 @@ class ChatGPTClient:
         model: str = "gpt-4o-mini",
         temperature: float = 0.7,
         max_tokens: int = 1024,
+        stream: bool = True,
+        on_chunk: Optional[Callable[[str], None]] = None,
     ) -> ChatResponse:
         """
         メッセージを送信してレスポンスを取得
@@ -59,6 +79,8 @@ class ChatGPTClient:
             model: 使用するモデル名
             temperature: 創造性パラメータ
             max_tokens: 最大出力トークン数
+            stream: ストリーミングレスポンスを使用するか
+            on_chunk: ストリーミング時のチャンクコールバック
 
         Returns:
             ChatResponse: APIからのレスポンス
@@ -93,21 +115,41 @@ class ChatGPTClient:
                 "content": user_message
             })
 
-            # API呼び出し
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            # モデルに応じて適切なmax_tokensパラメータを使用
+            max_tokens_param = self._get_max_tokens_param(model)
 
-            # レスポンスからテキストを抽出
-            content = response.choices[0].message.content
+            if stream:
+                # ストリーミングレスポンス
+                return self._stream_response(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    max_tokens_param=max_tokens_param,
+                    on_chunk=on_chunk
+                )
+            else:
+                # 通常のレスポンス
+                api_params = {
+                    'model': model,
+                    'messages': messages,
+                    'temperature': temperature,
+                    max_tokens_param: max_tokens,
+                }
+                response = self.client.chat.completions.create(**api_params)
 
-            return ChatResponse(
-                success=True,
-                content=content or ""
-            )
+                # getattr で安全にレスポンスからテキストを抽出
+                choices = getattr(response, 'choices', None)
+                if choices and len(choices) > 0:
+                    message = getattr(choices[0], 'message', None)
+                    content = getattr(message, 'content', None) if message else None
+                else:
+                    content = None
+
+                return ChatResponse(
+                    success=True,
+                    content=content or ""
+                )
 
         except Exception as e:
             # エラーハンドリング
@@ -118,6 +160,86 @@ class ChatGPTClient:
                 error_message = "APIキーが無効です"
             elif "rate_limit" in error_message.lower():
                 error_message = "レート制限に達しました。しばらく待ってから再試行してください"
+            elif "insufficient_quota" in error_message.lower():
+                error_message = "API利用枠が不足しています"
+            elif "connection" in error_message.lower():
+                error_message = "接続エラー: インターネット接続を確認してください"
+
+            return ChatResponse(
+                success=False,
+                error=error_message
+            )
+
+    def _stream_response(
+        self,
+        model: str,
+        messages: list,
+        temperature: float,
+        max_tokens: int,
+        max_tokens_param: str,
+        on_chunk: Optional[Callable[[str], None]] = None,
+    ) -> ChatResponse:
+        """
+        ストリーミングレスポンスを処理
+
+        Args:
+            model: モデル名
+            messages: メッセージリスト
+            temperature: 温度パラメータ
+            max_tokens: 最大トークン数
+            max_tokens_param: max_tokensパラメータ名（'max_tokens' または 'max_completion_tokens'）
+            on_chunk: チャンク受信時のコールバック
+
+        Returns:
+            ChatResponse: 完全なレスポンス
+        """
+        try:
+            # モデルに応じたパラメータで API を呼び出す
+            api_params = {
+                'model': model,
+                'messages': messages,
+                'temperature': temperature,
+                max_tokens_param: max_tokens,
+                'stream': True,
+            }
+            stream = self.client.chat.completions.create(**api_params)
+
+            full_content = ""
+            for chunk in stream:
+                # getattr で安全にチャンクデータを取得
+                choices = getattr(chunk, 'choices', None)
+                if not choices or len(choices) == 0:
+                    continue
+
+                delta = getattr(choices[0], 'delta', None)
+                if not delta:
+                    continue
+
+                chunk_text = getattr(delta, 'content', None)
+                if chunk_text:
+                    full_content += chunk_text
+
+                    # コールバックがあれば呼び出す
+                    if on_chunk:
+                        try:
+                            on_chunk(chunk_text)
+                        except Exception:
+                            # コールバックのエラーはストリーミングを中断しない
+                            pass
+
+            return ChatResponse(
+                success=True,
+                content=full_content
+            )
+
+        except Exception as e:
+            error_message = str(e)
+
+            # エラーを日本語化
+            if "invalid_api_key" in error_message.lower():
+                error_message = "APIキーが無効です"
+            elif "rate_limit" in error_message.lower():
+                error_message = "レート制限に達しました"
             elif "insufficient_quota" in error_message.lower():
                 error_message = "API利用枠が不足しています"
             elif "connection" in error_message.lower():
@@ -142,3 +264,44 @@ def create_client(api_key: str) -> Optional[ChatGPTClient]:
     if not api_key:
         return None
     return ChatGPTClient(api_key)
+
+
+def fetch_available_models(api_key: str) -> Optional[List[str]]:
+    """
+    OpenAI APIから利用可能なモデルのリストを取得
+
+    Args:
+        api_key: OpenAI APIキー
+
+    Returns:
+        Optional[List[str]]: モデルのリスト（取得失敗時はNone）
+    """
+    if not api_key:
+        return None
+
+    try:
+        client = OpenAI(api_key=api_key)
+        models_response = client.models.list()
+
+        # gpt-* モデルのみを抽出してソート
+        models = []
+        for model in models_response.data:
+            model_id = getattr(model, 'id', None)
+            if model_id and model_id.startswith('gpt-'):
+                models.append(model_id)
+
+        # モデルを優先度順にソート（新しいモデルを優先）
+        priority_order = ['gpt-4o', 'gpt-4', 'gpt-3.5']
+
+        def sort_key(model_name: str) -> tuple:
+            # 優先度を数値化（小さいほど優先）
+            for i, prefix in enumerate(priority_order):
+                if model_name.startswith(prefix):
+                    return (i, model_name)
+            return (len(priority_order), model_name)
+
+        models.sort(key=sort_key)
+        return models if models else None
+
+    except Exception:
+        return None

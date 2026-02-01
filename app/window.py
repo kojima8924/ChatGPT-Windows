@@ -16,13 +16,13 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QFormLayout, QScrollArea, QFrame
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QClipboard
+from PySide6.QtGui import QFont, QClipboard, QTextCursor
 
 from app.config import (
-    AppConfig, load_config, save_config, is_api_key_pattern,
+    AppConfig, load_config, save_config, is_api_key_pattern, get_api_key,
     AVAILABLE_MODELS, MAX_TOKENS_LIMIT, PromptPreset, DEFAULT_PRESETS
 )
-from app.api.openai_client import ChatGPTClient, ChatResponse
+from app.api.openai_client import ChatGPTClient, ChatResponse, fetch_available_models
 
 
 class PresetEditorDialog(QDialog):
@@ -47,7 +47,11 @@ class PresetEditorDialog(QDialog):
 
     def _setup_ui(self):
         """UIを構築"""
-        layout = QHBoxLayout(self)
+        # トップレベルレイアウトを1本に統一
+        main_layout = QVBoxLayout(self)
+
+        # 左右分割用の水平レイアウト
+        h_layout = QHBoxLayout()
 
         # 左側: プリセットリスト
         left_layout = QVBoxLayout()
@@ -78,7 +82,7 @@ class PresetEditorDialog(QDialog):
         list_btn_layout.addWidget(self.down_btn)
 
         left_layout.addLayout(list_btn_layout)
-        layout.addLayout(left_layout, 1)
+        h_layout.addLayout(left_layout, 1)
 
         # 右側: 編集フォーム
         right_layout = QVBoxLayout()
@@ -103,7 +107,10 @@ class PresetEditorDialog(QDialog):
         self.reset_btn.clicked.connect(self._reset_to_default)
         right_layout.addWidget(self.reset_btn)
 
-        layout.addLayout(right_layout, 2)
+        h_layout.addLayout(right_layout, 2)
+
+        # 水平レイアウトをメインに追加
+        main_layout.addLayout(h_layout)
 
         # ダイアログボタン
         button_box = QDialogButtonBox(
@@ -112,10 +119,7 @@ class PresetEditorDialog(QDialog):
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
 
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(layout)
         main_layout.addWidget(button_box)
-        self.setLayout(main_layout)
 
     def _update_list(self):
         """リストを更新"""
@@ -234,15 +238,38 @@ class PresetEditorDialog(QDialog):
         return self.presets
 
 
+class ModelFetchWorker(QThread):
+    """
+    モデルリストを取得するワーカー
+
+    起動時にOpenAI APIから利用可能なモデルを取得する。
+    """
+
+    # 完了シグナル: モデルリスト（Noneの場合は取得失敗）
+    finished = Signal(object)
+
+    def __init__(self, api_key: str):
+        super().__init__()
+        self.api_key = api_key
+
+    def run(self):
+        """モデルリストを取得"""
+        models = fetch_available_models(self.api_key)
+        self.finished.emit(models)
+
+
 class ApiWorker(QThread):
     """
     API呼び出しを別スレッドで実行するワーカー
 
     UIをブロックしないようにバックグラウンドでAPI通信を行う。
+    ストリーミングレスポンスに対応。
     """
 
     # 完了シグナル: レスポンスを返す
     finished = Signal(ChatResponse)
+    # ストリーミングチャンクシグナル: テキストの断片を返す
+    chunk_received = Signal(str)
 
     def __init__(
         self,
@@ -262,15 +289,21 @@ class ApiWorker(QThread):
         self.max_tokens = max_tokens
 
     def run(self):
-        """スレッドで実行される処理"""
+        """スレッドで実行される処理（ストリーミング対応）"""
         response = self.client.send_message(
             user_message=self.message,
             system_prompt=self.system_prompt,
             model=self.model,
             temperature=self.temperature,
-            max_tokens=self.max_tokens
+            max_tokens=self.max_tokens,
+            stream=True,
+            on_chunk=self._on_chunk
         )
         self.finished.emit(response)
+
+    def _on_chunk(self, chunk_text: str):
+        """ストリーミングチャンクを受信した時のコールバック"""
+        self.chunk_received.emit(chunk_text)
 
 
 class MainWindow(QMainWindow):
@@ -289,6 +322,7 @@ class MainWindow(QMainWindow):
         # APIクライアント（初期化は後で）
         self.client: ChatGPTClient = None
         self.worker: ApiWorker = None
+        self.model_fetch_worker: ModelFetchWorker = None
 
         # プリセットボタンのリスト
         self.preset_buttons: list = []
@@ -305,6 +339,9 @@ class MainWindow(QMainWindow):
         # 自動貼り付けが有効なら初回読み込み（APIキーはスキップ）
         if self.config.auto_paste:
             QTimer.singleShot(100, self._auto_paste_from_clipboard)
+
+        # モデルリストを動的に取得（非同期）
+        QTimer.singleShot(200, self._fetch_models)
 
     def _setup_ui(self):
         """UIコンポーネントを構築"""
@@ -341,11 +378,11 @@ class MainWindow(QMainWindow):
         # モデル選択とパラメータ
         params_layout = QHBoxLayout()
 
-        # モデル選択（定数から読み込み）
+        # モデル選択（ドロップダウンリストから選択のみ）
         params_layout.addWidget(QLabel("モデル:"))
         self.model_combo = QComboBox()
         self.model_combo.addItems(AVAILABLE_MODELS)
-        self.model_combo.setEditable(True)  # カスタムモデル入力可能
+        self.model_combo.setEditable(False)  # ドロップダウン選択式
         params_layout.addWidget(self.model_combo)
 
         params_layout.addSpacing(20)
@@ -460,7 +497,11 @@ class MainWindow(QMainWindow):
 
         self.input_text = QTextEdit()
         self.input_text.setPlaceholderText("ここにテキストを入力、またはクリップボードから貼り付け...")
-        self.input_text.setFont(QFont("Consolas", 10))
+        # 日本語混在に対応したフォント設定（フォールバック付き）
+        input_font = QFont()
+        input_font.setFamilies(["Consolas", "Yu Gothic UI", "MS Gothic"])
+        input_font.setPointSize(10)
+        self.input_text.setFont(input_font)
         input_layout.addWidget(self.input_text)
 
         splitter.addWidget(input_widget)
@@ -487,7 +528,11 @@ class MainWindow(QMainWindow):
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setPlaceholderText("APIからの応答がここに表示されます...")
-        self.output_text.setFont(QFont("Consolas", 10))
+        # 日本語混在に対応したフォント設定（フォールバック付き）
+        output_font = QFont()
+        output_font.setFamilies(["Consolas", "Yu Gothic UI", "MS Gothic"])
+        output_font.setPointSize(10)
+        self.output_text.setFont(output_font)
         output_layout.addWidget(self.output_text)
 
         splitter.addWidget(output_widget)
@@ -640,7 +685,9 @@ class MainWindow(QMainWindow):
 
     def _apply_config(self):
         """設定をUIに反映"""
-        self.api_key_input.setText(self.config.api_key)
+        # APIキーは自動表示しない（ユーザーが入力した場合のみ表示）
+        # 環境変数やkeyringから取得したキーは送信時に使用
+        # self.api_key_input.setText(self.config.api_key)
         self.model_combo.setCurrentText(self.config.model)
         self.system_prompt_input.setPlainText(self.config.system_prompt)
         self.temp_spin.setValue(self.config.temperature)
@@ -748,6 +795,10 @@ class MainWindow(QMainWindow):
                 self.worker.finished.disconnect()
             except RuntimeError:
                 pass  # すでに接続解除されている場合
+            try:
+                self.worker.chunk_received.disconnect()
+            except RuntimeError:
+                pass  # すでに接続解除されている場合
             # スレッドが終了するまで待機（タイムアウト付き）
             if self.worker.isRunning():
                 self.worker.wait(1000)  # 最大1秒待機
@@ -755,11 +806,15 @@ class MainWindow(QMainWindow):
 
     def _send_request(self):
         """APIリクエストを送信"""
-        # APIキーチェック
+        # APIキーチェック（UI入力→環境変数/keyringの順でフォールバック）
         api_key = self.api_key_input.text().strip()
         if not api_key:
-            self._set_status("APIキーを入力してください", "red")
-            return
+            # UI入力が空の場合、環境変数またはkeyringから取得
+            from app.config import get_api_key
+            api_key = get_api_key()
+            if not api_key:
+                self._set_status("APIキーを入力してください", "red")
+                return
 
         # 入力テキストチェック
         input_text = self.input_text.toPlainText().strip()
@@ -777,10 +832,19 @@ class MainWindow(QMainWindow):
         # クライアント作成
         self.client = ChatGPTClient(api_key)
 
-        # UIを処理中状態に
+        # UIを処理中状態に（誤操作防止のため各種UI要素を無効化）
         self.send_btn.setEnabled(False)
         self.send_btn.setText("処理中...")
+        self.api_key_input.setEnabled(False)
+        self.model_combo.setEnabled(False)
+        self.temp_spin.setEnabled(False)
+        self.tokens_spin.setEnabled(False)
+        self.edit_preset_btn.setEnabled(False)
+        self.save_config_btn.setEnabled(False)
         self._set_status("APIリクエスト中...", "blue")
+
+        # 出力テキストをクリア（ストリーミング準備）
+        self.output_text.clear()
 
         # ワーカースレッドを作成・開始
         self.worker = ApiWorker(
@@ -793,18 +857,36 @@ class MainWindow(QMainWindow):
         )
         # UniqueConnectionで重複接続を防止
         self.worker.finished.connect(self._on_response, Qt.UniqueConnection)
+        self.worker.chunk_received.connect(self._on_chunk, Qt.UniqueConnection)
         self.worker.start()
 
+    def _on_chunk(self, chunk_text: str):
+        """ストリーミングチャンクを受信した時の処理"""
+        # 現在のカーソル位置を保持
+        cursor = self.output_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(chunk_text)
+        self.output_text.setTextCursor(cursor)
+        # 自動スクロール
+        self.output_text.ensureCursorVisible()
+
     def _on_response(self, response: ChatResponse):
-        """APIレスポンスを受信した時の処理"""
-        # UIを通常状態に戻す
+        """APIレスポンスを受信した時の処理（ストリーミング完了時）"""
+        # UIを通常状態に戻す（全要素を有効化）
         self.send_btn.setEnabled(True)
         self.send_btn.setText("送信 (Ctrl+Enter)")
+        self.api_key_input.setEnabled(True)
+        self.model_combo.setEnabled(True)
+        self.temp_spin.setEnabled(True)
+        self.tokens_spin.setEnabled(True)
+        self.edit_preset_btn.setEnabled(True)
+        self.save_config_btn.setEnabled(True)
 
         if response.success:
-            self.output_text.setPlainText(response.content)
+            # ストリーミングで既にテキストは表示されているので、ステータスのみ更新
             self._set_status("完了", "green")
         else:
+            # エラーの場合は出力エリアにエラーメッセージを表示
             self.output_text.setPlainText(f"エラー: {response.error}")
             self._set_status(f"エラー: {response.error}", "red")
 
@@ -820,7 +902,55 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         self.status_label.setStyleSheet(f"color: {color_map.get(color, color)};")
 
+    def _fetch_models(self):
+        """利用可能なモデルリストを動的に取得"""
+        # APIキーを取得（UI入力→環境変数/keyringの順）
+        api_key = self.api_key_input.text().strip()
+        if not api_key:
+            api_key = get_api_key()
+
+        if not api_key:
+            # APIキーがない場合はデフォルトリストを使用
+            return
+
+        # 既にワーカーが実行中の場合はスキップ
+        if self.model_fetch_worker and self.model_fetch_worker.isRunning():
+            return
+
+        # ワーカースレッドでモデルリストを取得
+        self.model_fetch_worker = ModelFetchWorker(api_key)
+        self.model_fetch_worker.finished.connect(self._on_models_fetched, Qt.UniqueConnection)
+        self.model_fetch_worker.start()
+
+    def _on_models_fetched(self, models):
+        """モデルリスト取得完了時の処理"""
+        if models and len(models) > 0:
+            # 現在選択されているモデルを保持
+            current_model = self.model_combo.currentText()
+
+            # コンボボックスを更新
+            self.model_combo.clear()
+            self.model_combo.addItems(models)
+
+            # 以前のモデルが新しいリストにあれば選択を維持
+            index = self.model_combo.findText(current_model)
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+            else:
+                # なければ最初のモデルを選択
+                self.model_combo.setCurrentIndex(0)
+
+            self._set_status(f"モデルリストを更新しました（{len(models)}件）", "green")
+        else:
+            # 取得失敗時はデフォルトリストを維持（何もしない）
+            self._set_status("モデルリスト取得失敗、デフォルトを使用", "orange")
+
     def closeEvent(self, event):
         """ウィンドウ終了時のクリーンアップ"""
         self._cleanup_worker()
+
+        # モデル取得ワーカーもクリーンアップ
+        if self.model_fetch_worker and self.model_fetch_worker.isRunning():
+            self.model_fetch_worker.wait(1000)
+
         super().closeEvent(event)
