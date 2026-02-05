@@ -38,3 +38,9 @@ Thumbs.db
 
 # Project specific
 *.log
+
+# Claude Code
+.claude/
+
+# Windows null device artifact
+nul
