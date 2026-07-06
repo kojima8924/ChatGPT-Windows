@@ -43,7 +43,8 @@ class ChatGPTClient:
         Args:
             api_key: OpenAI APIキー
         """
-        self.client = OpenAI(api_key=api_key)
+        # タイムアウトを設定（接続やチャンク間の無応答が続いた場合に例外を発生させ、ハングを防ぐ）
+        self.client = OpenAI(api_key=api_key, timeout=60.0)
         self.api_key = api_key
 
     def _localize_error(self, error_message: str) -> str:
@@ -456,21 +457,6 @@ class ChatGPTClient:
             )
 
 
-def create_client(api_key: str) -> Optional[ChatGPTClient]:
-    """
-    ChatGPTクライアントを作成
-
-    Args:
-        api_key: OpenAI APIキー
-
-    Returns:
-        Optional[ChatGPTClient]: クライアント（APIキーが空の場合はNone）
-    """
-    if not api_key:
-        return None
-    return ChatGPTClient(api_key)
-
-
 def fetch_available_models(api_key: str) -> Optional[List[str]]:
     """
     OpenAI APIから利用可能なモデルのリストを取得
@@ -488,19 +474,23 @@ def fetch_available_models(api_key: str) -> Optional[List[str]]:
         client = OpenAI(api_key=api_key)
         models_response = client.models.list()
 
-        # gpt-* および o1-*, o3-* モデルを抽出
+        # テキスト生成に使えるモデルのプレフィックス
+        INCLUDED_PREFIXES = ('gpt-', 'chatgpt-', 'o1', 'o3', 'o4')
+        # テキスト生成に使えないモデルを除外するキーワード
+        EXCLUDED_KEYWORDS = ('realtime', 'audio', 'tts', 'transcribe', 'search',
+                             'image', 'embedding', 'moderation', 'instruct')
+
+        # テキスト生成に使えるモデルのみを抽出
         models = []
         for model in models_response.data:
             model_id = getattr(model, 'id', None)
             if model_id:
-                # gpt-*, o1-*, o3-* モデルを含める
-                if (model_id.startswith('gpt-') or
-                    model_id.startswith('o1-') or
-                    model_id.startswith('o3-')):
+                if (model_id.startswith(INCLUDED_PREFIXES) and
+                        not any(kw in model_id for kw in EXCLUDED_KEYWORDS)):
                     models.append(model_id)
 
         # モデルを優先度順にソート（新しいモデルを優先）
-        priority_order = ['gpt-5', 'gpt-4o', 'gpt-4', 'o1-', 'o3-', 'gpt-3.5']
+        priority_order = ['gpt-5', 'gpt-4o', 'gpt-4', 'o1-', 'o3-', 'o4-', 'gpt-3.5']
 
         def sort_key(model_name: str) -> tuple:
             # 優先度を数値化（小さいほど優先）

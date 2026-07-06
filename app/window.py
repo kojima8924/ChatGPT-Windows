@@ -23,7 +23,6 @@ from PySide6.QtGui import QFont, QClipboard, QTextCursor, QIcon, QAction
 
 import ctypes  # グローバルホットキー用 (Win32 API)
 from ctypes import wintypes
-import subprocess  # プロセス終了用
 
 from app.config import (
     AppConfig, load_config, save_config, is_api_key_pattern, get_api_key,
@@ -255,8 +254,8 @@ class ModelFetchWorker(QThread):
     起動時にOpenAI APIから利用可能なモデルを取得する。
     """
 
-    # 完了シグナル: モデルリスト（Noneの場合は取得失敗）
-    finished = Signal(object)
+    # モデルリスト取得完了シグナル: モデルリスト（Noneの場合は取得失敗）
+    models_fetched = Signal(object)
 
     def __init__(self, api_key: str):
         super().__init__()
@@ -265,7 +264,7 @@ class ModelFetchWorker(QThread):
     def run(self):
         """モデルリストを取得"""
         models = fetch_available_models(self.api_key)
-        self.finished.emit(models)
+        self.models_fetched.emit(models)
 
 
 class ApiWorker(QThread):
@@ -276,8 +275,8 @@ class ApiWorker(QThread):
     ストリーミングレスポンスに対応し、キャンセル機能を持つ。
     """
 
-    # 完了シグナル: レスポンスを返す
-    finished = Signal(ChatResponse)
+    # レスポンス受信完了シグナル: レスポンスを返す
+    response_received = Signal(ChatResponse)
     # ストリーミングチャンクシグナル: テキストの断片を返す
     chunk_received = Signal(str)
 
@@ -312,7 +311,7 @@ class ApiWorker(QThread):
             on_chunk=self._on_chunk,
             cancel_event=self.cancel_event
         )
-        self.finished.emit(response)
+        self.response_received.emit(response)
 
     def _on_chunk(self, chunk_text: str):
         """ストリーミングチャンクを受信した時のコールバック"""
@@ -339,6 +338,9 @@ class MainWindow(QMainWindow):
 
         # キャンセル用のイベント
         self.cancel_event: threading.Event = None
+
+        # タイムアウトしたワーカーの参照保持（GCによるQThread破棄クラッシュ防止）
+        self._zombie_workers: list = []
 
         # プリセットボタンのリスト
         self.preset_buttons: list = []
@@ -741,7 +743,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QKeyEvent
 
         if obj == self.input_text and event.type() == QEvent.KeyPress:
-            if event.key() == Qt.Key_Return and event.modifiers() == Qt.ControlModifier:
+            # テンキーEnter（Qt.Key_Enter、KeypadModifier付き）にも対応
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
                 self._send_request()
                 return True
         return super().eventFilter(obj, event)
@@ -789,6 +792,9 @@ class MainWindow(QMainWindow):
                 self.api_key_input.setText(API_KEY_MASKED)
             else:
                 self.api_key_input.clear()
+            # コンボがプレースホルダ状態ならモデルリストを再取得（初回キー設定後の動線対応）
+            if self.model_combo.currentText().startswith("(") or not self.model_combo.isEnabled():
+                self._fetch_models()
         else:
             self._set_status("設定の保存に失敗しました", "red")
 
@@ -872,8 +878,7 @@ class MainWindow(QMainWindow):
 
         優先順位:
         1) UI入力（ただしマスク表示は除外）
-        2) self.config.api_key（keyringから読み込み済み）
-        3) get_api_key()（環境変数→keyring）
+        2) get_api_key()（環境変数 → keyring の順）
 
         Returns:
             str: 解決されたAPIキー（未解決なら空文字列）
@@ -883,11 +888,7 @@ class MainWindow(QMainWindow):
         if ui_key and ui_key != API_KEY_MASKED:
             return ui_key
 
-        # 2) config.api_key（keyringから読み込み済み）
-        if self.config.api_key:
-            return self.config.api_key
-
-        # 3) get_api_key()（環境変数→keyring）
+        # 2) 環境変数 → keyring の順で取得
         key = get_api_key()
         return key if key else ""
 
@@ -899,7 +900,7 @@ class MainWindow(QMainWindow):
                 self.cancel_event.set()
             # シグナル接続を解除
             try:
-                self.worker.finished.disconnect()
+                self.worker.response_received.disconnect()
             except RuntimeError:
                 pass  # すでに接続解除されている場合
             try:
@@ -909,8 +910,19 @@ class MainWindow(QMainWindow):
             # スレッドが終了するまで待機（タイムアウト付き）
             if self.worker.isRunning():
                 self.worker.wait(1500)  # 最大1.5秒待機
+            # それでも終了しない場合は参照を保持し、GCによるQThread破棄クラッシュを防ぐ
+            if self.worker.isRunning():
+                zombie = self.worker
+                self._zombie_workers.append(zombie)
+                # QThread組み込みのfinishedシグナルで終了時にリストから除去
+                zombie.finished.connect(lambda z=zombie: self._reap_zombie(z))
             self.worker = None
             self.cancel_event = None
+
+    def _reap_zombie(self, zombie):
+        """終了したゾンビワーカーを参照リストから除去"""
+        if zombie in self._zombie_workers:
+            self._zombie_workers.remove(zombie)
 
     def _send_request(self):
         """APIリクエストを送信"""
@@ -954,18 +966,23 @@ class MainWindow(QMainWindow):
         # 出力テキストをクリア（ストリーミング準備）
         self.output_text.clear()
 
+        # モデル名を解決（プレースホルダ表示中は設定値にフォールバック）
+        model = self.model_combo.currentText()
+        if not model or model.startswith("("):
+            model = self.config.model
+
         # ワーカースレッドを作成・開始
         self.worker = ApiWorker(
             client=self.client,
             message=input_text,
             system_prompt=self.system_prompt_input.toPlainText(),
-            model=self.model_combo.currentText(),
+            model=model,
             temperature=self.temp_spin.value(),
             max_tokens=self.tokens_spin.value(),
             cancel_event=self.cancel_event
         )
         # UniqueConnectionで重複接続を防止
-        self.worker.finished.connect(self._on_response, Qt.UniqueConnection)
+        self.worker.response_received.connect(self._on_response, Qt.UniqueConnection)
         self.worker.chunk_received.connect(self._on_chunk, Qt.UniqueConnection)
         self.worker.start()
 
@@ -1066,7 +1083,7 @@ class MainWindow(QMainWindow):
 
         # ワーカースレッドでモデルリストを取得
         self.model_fetch_worker = ModelFetchWorker(api_key)
-        self.model_fetch_worker.finished.connect(self._on_models_fetched, Qt.UniqueConnection)
+        self.model_fetch_worker.models_fetched.connect(self._on_models_fetched, Qt.UniqueConnection)
         self.model_fetch_worker.start()
 
     def _on_models_fetched(self, models):
@@ -1175,8 +1192,6 @@ class MainWindow(QMainWindow):
 
     def _show_window(self):
         """ウィンドウを表示してアクティブ化"""
-        # 他のChatGPT-Webプロセスを終了
-        self._kill_chatgpt_web()
         self.showNormal()
         self.activateWindow()
         self.raise_()
@@ -1184,27 +1199,26 @@ class MainWindow(QMainWindow):
         if self.config.auto_paste:
             QTimer.singleShot(100, self._auto_paste_from_clipboard)
 
-    def _kill_chatgpt_web(self):
-        """ChatGPT-Web プロセスを終了"""
-        try:
-            # taskkill /F /T でツリーごと強制終了
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/IM", "ChatGPT-Web.exe"],
-                capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-        except Exception:
-            pass  # 失敗しても無視
-
     def _on_tray_activated(self, reason):
         """トレイアイコンがアクティブ化された時"""
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._show_window()
 
+    def _shutdown_cleanup(self):
+        """終了時の共通クリーンアップ（ホットキー解除・ワーカー停止）"""
+        self._unregister_hotkey()
+        # ワーカーが実行中ならキャンセル指示を出してから清掃
+        if self.worker is not None and self.worker.isRunning():
+            if self.cancel_event:
+                self.cancel_event.set()
+        self._cleanup_worker()
+        if self.model_fetch_worker and self.model_fetch_worker.isRunning():
+            self.model_fetch_worker.wait(1500)
+
     def _quit_app(self):
         """アプリケーションを終了"""
         self._force_quit = True
-        self._unregister_hotkey()
+        self._shutdown_cleanup()
         self.tray_icon.hide()
         QApplication.quit()
 
@@ -1212,19 +1226,7 @@ class MainWindow(QMainWindow):
         """ウィンドウ終了時の処理"""
         # 強制終了フラグがある場合はクリーンアップして終了
         if getattr(self, '_force_quit', False):
-            # ホットキー解除
-            self._unregister_hotkey()
-
-            # ワーカーが実行中ならキャンセル指示だけ出す
-            if self.worker is not None and self.worker.isRunning():
-                if self.cancel_event:
-                    self.cancel_event.set()
-
-            self._cleanup_worker()
-
-            if self.model_fetch_worker and self.model_fetch_worker.isRunning():
-                self.model_fetch_worker.wait(1500)
-
+            self._shutdown_cleanup()
             super().closeEvent(event)
         else:
             # 通常の閉じるボタンは非表示にするだけ

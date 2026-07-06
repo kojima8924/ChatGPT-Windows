@@ -20,7 +20,6 @@ import keyring
 # ============================================
 CONFIG_DIR = Path.home() / ".chatgpt-windows"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-LOCK_FILE = CONFIG_DIR / "config.lock"
 
 # ============================================
 # キーリング設定（Windows資格情報マネージャー用）
@@ -261,7 +260,6 @@ def save_config(config: AppConfig) -> bool:
 
     APIキーはWindows資格情報マネージャーに安全に保存される。
     その他の設定はJSONファイルに保存される。
-    ファイルロックを使用して競合を防ぐ。
 
     Args:
         config: 保存する設定
@@ -281,17 +279,8 @@ def save_config(config: AppConfig) -> bool:
         data = asdict(config)
         data.pop("api_key", None)
 
-        # ファイルロックを使用して書き込み（Windows互換）
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            try:
-                # Windows環境ではmsvcrtを使用
-                import msvcrt
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-            except (ImportError, OSError):
-                # ロックが取得できない場合はそのまま書き込み
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
         return True
     except (IOError, OSError):
