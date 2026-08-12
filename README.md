@@ -1,13 +1,13 @@
 # ChatGPT-Windows
 
-Windows向けのChatGPTデスクトップクライアント。クリップボードのテキストをワンクリックでChatGPT APIに送信し、ストリーミングで結果を表示します。翻訳・補完・要約をホットキーとクリップボードから呼び出せる常駐アプリです。
+翻訳・補完・要約をホットキーとクリップボードから呼び出せるWindows常駐クライアント。選択したテキストをワンクリックでOpenAI APIへ送信し、結果をストリーミング表示します。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PySide6](https://img.shields.io/badge/GUI-PySide6%20(Qt6)-green)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-> 本リポジトリは過去に制作した作品です。現在の主要な開発内容はポートフォリオを参照してください: https://kojima8924.github.io/
+> 本リポジトリは過去に制作した作品です。現在の主要な開発内容は[ポートフォリオ](https://kojima8924.github.io/)を参照してください。
 
 ## 特徴
 
