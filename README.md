@@ -1,11 +1,13 @@
-# ChatGPT Desktop
+# ChatGPT-Windows
 
-Windows向けのChatGPTデスクトップクライアント。クリップボードのテキストをワンクリックでChatGPT APIに送信し、ストリーミングで結果を表示します。
+Windows向けのChatGPTデスクトップクライアント。クリップボードのテキストをワンクリックでChatGPT APIに送信し、ストリーミングで結果を表示します。翻訳・補完・要約をホットキーとクリップボードから呼び出せる常駐アプリです。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PySide6](https://img.shields.io/badge/GUI-PySide6%20(Qt6)-green)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
+
+> 本リポジトリは過去に制作した作品です。現在の主要な開発内容はポートフォリオを参照してください: https://kojima8924.github.io/
 
 ## 特徴
 
@@ -19,11 +21,6 @@ Windows向けのChatGPTデスクトップクライアント。クリップボー
 - **ダークテーマ** - 目に優しいダークモードUI
 - **モデル自動取得** - 利用可能なGPTモデルをAPIから自動取得
 - **パラメータ調整** - Temperature、最大トークン数を自由に設定
-
-## スクリーンショット
-
-<!-- スクリーンショットを追加する場合: -->
-<!-- ![メイン画面](docs/screenshot.png) -->
 
 ## 必要環境
 
